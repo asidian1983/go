@@ -25,6 +25,14 @@ func lenAndUpper(name string) (lenght int, uppercase string) {
 	return
 }
 
+func canIDrink(age int) bool {
+	if koreanAge := age + 2; koreanAge < 19 {
+		return false
+	} else {
+		return true
+	}
+}
+
 func repeat(words ...string) {
 	fmt.Println(words)
 }
@@ -44,4 +52,7 @@ func main() {
 
 	result := superAdd(1, 2, 3, 4, 5)
 	fmt.Println(result)
+
+	fmt.Println(canIDrink(16))
+	fmt.Println(canIDrink(18))
 }
