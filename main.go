@@ -63,8 +63,11 @@ func main() {
 	result := superAdd(1, 2, 3, 4, 5)
 	fmt.Println(result)
 
+	// if else
 	fmt.Println(canIDrink(16))
 	fmt.Println(canIDrink(18))
+
+	// switch
 	fmt.Println(canIDrink2(10))
 
 	// pointer
@@ -75,4 +78,11 @@ func main() {
 	*c = 20
 	fmt.Println(a, b, c)
 	fmt.Println(&a, &b, *c)
+
+	// array
+	names := []string{"1", "2", "3", "4", "5"}
+	names[2] = "test"
+
+	names = append(names, "append")
+	fmt.Println(names)
 }
