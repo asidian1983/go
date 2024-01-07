@@ -66,4 +66,13 @@ func main() {
 	fmt.Println(canIDrink(16))
 	fmt.Println(canIDrink(18))
 	fmt.Println(canIDrink2(10))
+
+	// pointer
+	a := 2
+	b := a
+	c := &a
+	a = 10
+	*c = 20
+	fmt.Println(a, b, c)
+	fmt.Println(&a, &b, *c)
 }
