@@ -47,6 +47,12 @@ func repeat(words ...string) {
 	fmt.Println(words)
 }
 
+type person struct {
+	name    string
+	age     int
+	favFood []string
+}
+
 func main() {
 	const name string = "test"
 	test := false
@@ -89,4 +95,14 @@ func main() {
 	// map
 	mapt := map[string]string{"name": "name1", "age": "12"}
 	fmt.Println(mapt)
+
+	for k, v := range mapt {
+		fmt.Println(k, v)
+	}
+
+	// struct
+	favFood := []string{"kim", "ramen", "corn"}
+	user := person{name: "chang", age: 18, favFood: favFood}
+
+	fmt.Println(user)
 }
