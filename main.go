@@ -33,6 +33,16 @@ func canIDrink(age int) bool {
 	}
 }
 
+func canIDrink2(age int) bool {
+	switch koreanAge := age + 2; koreanAge {
+	case 10:
+		return false
+	case 18:
+		return true
+	}
+	return false
+}
+
 func repeat(words ...string) {
 	fmt.Println(words)
 }
@@ -55,4 +65,5 @@ func main() {
 
 	fmt.Println(canIDrink(16))
 	fmt.Println(canIDrink(18))
+	fmt.Println(canIDrink2(10))
 }
