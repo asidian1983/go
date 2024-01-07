@@ -13,6 +13,10 @@ func lenAndUpper(name string) (int, string) {
 	return len(name), strings.ToUpper(name)
 }
 
+func repeat(words ...string) {
+	fmt.Println(words)
+}
+
 func main() {
 	const name string = "test"
 	test := false
@@ -23,4 +27,6 @@ func main() {
 
 	totalLengtht, upperText := lenAndUpper(name)
 	fmt.Println(totalLengtht, upperText)
+
+	repeat("1", "2", "3")
 }
