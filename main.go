@@ -85,4 +85,8 @@ func main() {
 
 	names = append(names, "append")
 	fmt.Println(names)
+
+	// map
+	mapt := map[string]string{"name": "name1", "age": "12"}
+	fmt.Println(mapt)
 }
