@@ -8,10 +8,16 @@ import (
 
 type Router struct {
 	health *HealthHandler
+	ws     wsHandler
 }
 
-func NewRouter(health *HealthHandler) *Router {
-	return &Router{health: health}
+// wsHandler is a narrow interface so the router does not import the ws package directly.
+type wsHandler interface {
+	ServeWS(c *gin.Context)
+}
+
+func NewRouter(health *HealthHandler, ws wsHandler) *Router {
+	return &Router{health: health, ws: ws}
 }
 
 func (r *Router) Register(engine *gin.Engine) {
@@ -20,6 +26,9 @@ func (r *Router) Register(engine *gin.Engine) {
 
 	// Ops endpoints — no auth required
 	engine.GET("/health", r.health.Check)
+
+	// WebSocket endpoint
+	engine.GET("/ws", r.ws.ServeWS)
 
 	// 404 handler
 	engine.NoRoute(func(c *gin.Context) {
