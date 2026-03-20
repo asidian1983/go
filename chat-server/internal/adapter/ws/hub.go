@@ -2,97 +2,248 @@ package ws
 
 import "go.uber.org/zap"
 
-// Hub is the central connection manager.
+// ---------- Internal command types ----------
+// All Hub state mutations are serialised through channels so that Hub.Run()
+// is the sole owner of clients and rooms — no mutex is ever required.
+
+type joinCmd struct {
+	client *Client
+	roomID string
+}
+
+type leaveCmd struct {
+	client *Client
+	roomID string
+}
+
+// roomcast delivers msg to every member of roomID.
+// sender is the originating client (used for authorisation); nil means a
+// server-generated broadcast that skips the membership check.
+type roomcast struct {
+	roomID string
+	msg    []byte
+	sender *Client
+}
+
+// Hub is the central, room-aware connection manager.
 //
 // Concurrency model:
 //   - Hub.Run() occupies exactly ONE goroutine.
-//   - The clients map is owned exclusively by that goroutine →
-//     no mutex is ever needed to read or write the map.
-//   - All external interaction (register, unregister, broadcast)
-//     happens through buffered channels, making the API goroutine-safe
-//     by construction: callers never touch shared state directly.
+//   - clients and rooms maps are owned exclusively by that goroutine → no mutex.
+//   - All external interaction (register, unregister, join, leave, broadcast)
+//     happens through buffered channels, making the API goroutine-safe by
+//     construction.
 //
 // Message flow:
 //
-//	Client.readPump ──► hub.Broadcast ──► Hub.Run ──► client.send (per client)
-//	                                                       │
-//	                                               Client.writePump ──► WebSocket
+//	Client.ReadPump ──► hub.Join / hub.Leave / hub.Broadcast
+//	                              │
+//	                         Hub.Run()
+//	                              │
+//	                       fanout(roomID)
+//	                              │
+//	               client.send ──► Client.WritePump ──► WebSocket
 type Hub struct {
-	// clients holds all currently connected clients.
-	// Owned solely by Run(); never accessed from outside.
-	clients map[*Client]struct{}
+	// clients: connectionID → *Client. Owned by Run().
+	clients map[string]*Client
+	// rooms: roomID → (connectionID → *Client). Owned by Run().
+	rooms map[string]map[string]*Client
 
-	// Register enqueues a new client for addition.
-	Register chan *Client
-
-	// Unregister enqueues a client for removal and channel close.
+	Register   chan *Client
 	Unregister chan *Client
-
-	// Broadcast enqueues a message to be sent to all clients.
-	Broadcast chan []byte
+	Join       chan joinCmd
+	Leave      chan leaveCmd
+	Broadcast  chan roomcast
 
 	log *zap.Logger
 }
 
+// NewHub constructs a Hub ready to be started with Run().
 func NewHub(log *zap.Logger) *Hub {
 	return &Hub{
-		clients:    make(map[*Client]struct{}),
+		clients:    make(map[string]*Client),
+		rooms:      make(map[string]map[string]*Client),
 		Register:   make(chan *Client, 256),
 		Unregister: make(chan *Client, 256),
-		Broadcast:  make(chan []byte, 512),
+		Join:       make(chan joinCmd, 256),
+		Leave:      make(chan leaveCmd, 256),
+		Broadcast:  make(chan roomcast, 512),
 		log:        log,
 	}
 }
 
-// Run starts the hub event loop. Call this in its own goroutine.
+// Run starts the hub event loop. Must be called in its own goroutine.
 // It exits cleanly when stop is closed.
 func (h *Hub) Run(stop <-chan struct{}) {
 	h.log.Info("hub started")
 	for {
 		select {
+
+		// ── Registration ────────────────────────────────────────────────────
 		case client := <-h.Register:
-			h.clients[client] = struct{}{}
+			h.clients[client.ID] = client
 			h.log.Info("client registered",
-				zap.String("id", client.ID),
+				zap.String("clientID", client.ID),
+				zap.String("userID", client.UserID),
 				zap.Int("total", len(h.clients)),
 			)
 
 		case client := <-h.Unregister:
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send) // signals writePump to exit
+			if _, ok := h.clients[client.ID]; ok {
+				h.evict(client)
 				h.log.Info("client unregistered",
-					zap.String("id", client.ID),
+					zap.String("clientID", client.ID),
+					zap.String("userID", client.UserID),
 					zap.Int("total", len(h.clients)),
 				)
 			}
 
-		case message := <-h.Broadcast:
-			for client := range h.clients {
-				select {
-				case client.send <- message:
-				default:
-					// send buffer full → client is too slow, drop and remove
-					delete(h.clients, client)
-					close(client.send)
-					h.log.Warn("client send buffer full, dropped", zap.String("id", client.ID))
+		// ── Room management ──────────────────────────────────────────────────
+		case cmd := <-h.Join:
+			// Idempotent: joining an already-joined room is a no-op.
+			if _, already := cmd.client.rooms[cmd.roomID]; already {
+				h.safeSend(cmd.client, buildEnvelope(EventAck, cmd.roomID,
+					AckPayload{OK: true, Message: "already in room"}))
+				break
+			}
+			if h.rooms[cmd.roomID] == nil {
+				h.rooms[cmd.roomID] = make(map[string]*Client)
+			}
+			h.rooms[cmd.roomID][cmd.client.ID] = cmd.client
+			cmd.client.rooms[cmd.roomID] = struct{}{}
+
+			// Notify existing members (excluding the joiner).
+			h.fanout(cmd.roomID,
+				buildEnvelope(EventNotify, cmd.roomID, NotifyPayload{
+					RoomID: cmd.roomID,
+					UserID: cmd.client.UserID,
+					Text:   cmd.client.UserID + " joined",
+				}),
+				cmd.client,
+			)
+			// Acknowledge the joiner.
+			h.safeSend(cmd.client, buildEnvelope(EventAck, cmd.roomID,
+				AckPayload{OK: true, Message: "joined " + cmd.roomID}))
+
+			h.log.Info("client joined room",
+				zap.String("clientID", cmd.client.ID),
+				zap.String("userID", cmd.client.UserID),
+				zap.String("roomID", cmd.roomID),
+				zap.Int("members", len(h.rooms[cmd.roomID])),
+			)
+
+		case cmd := <-h.Leave:
+			if _, in := cmd.client.rooms[cmd.roomID]; !in {
+				h.safeSend(cmd.client, buildEnvelope(EventError, cmd.roomID,
+					ErrorPayload{Code: "not_in_room", Message: "you are not in this room"}))
+				break
+			}
+			h.removeFromRoom(cmd.client, cmd.roomID)
+			// Notify remaining members.
+			h.fanout(cmd.roomID,
+				buildEnvelope(EventNotify, cmd.roomID, NotifyPayload{
+					RoomID: cmd.roomID,
+					UserID: cmd.client.UserID,
+					Text:   cmd.client.UserID + " left",
+				}),
+				nil,
+			)
+			h.safeSend(cmd.client, buildEnvelope(EventAck, cmd.roomID,
+				AckPayload{OK: true, Message: "left " + cmd.roomID}))
+
+			h.log.Info("client left room",
+				zap.String("clientID", cmd.client.ID),
+				zap.String("userID", cmd.client.UserID),
+				zap.String("roomID", cmd.roomID),
+			)
+
+		// ── Message broadcast ────────────────────────────────────────────────
+		case cast := <-h.Broadcast:
+			if _, ok := h.rooms[cast.roomID]; !ok {
+				if cast.sender != nil {
+					h.safeSend(cast.sender, buildEnvelope(EventError, cast.roomID,
+						ErrorPayload{Code: "room_not_found", Message: "room does not exist; join first"}))
+				}
+				break
+			}
+			if cast.sender != nil {
+				if _, in := cast.sender.rooms[cast.roomID]; !in {
+					h.safeSend(cast.sender, buildEnvelope(EventError, cast.roomID,
+						ErrorPayload{Code: "not_in_room", Message: "join the room before sending messages"}))
+					break
 				}
 			}
+			// Deliver to ALL members including sender (echo-back = delivery confirmation).
+			h.fanout(cast.roomID, cast.msg, nil)
 
+		// ── Shutdown ─────────────────────────────────────────────────────────
 		case <-stop:
 			h.log.Info("hub stopping")
-			// Drain remaining clients
-			for client := range h.clients {
+			for _, client := range h.clients {
 				close(client.send)
-				delete(h.clients, client)
 			}
 			return
 		}
 	}
 }
 
-// ConnectedCount returns the number of connected clients.
-// Safe to call only from within Run()'s goroutine (e.g. in tests via a wrapper).
-func (h *Hub) ConnectedCount() int {
-	return len(h.clients)
+// fanout sends msg to every member of roomID except exclude (may be nil).
+// Slow clients whose send buffer is full are evicted.
+func (h *Hub) fanout(roomID string, msg []byte, exclude *Client) {
+	for _, c := range h.rooms[roomID] {
+		if c == exclude {
+			continue
+		}
+		select {
+		case c.send <- msg:
+		default:
+			h.log.Warn("send buffer full, evicting client",
+				zap.String("clientID", c.ID),
+				zap.String("userID", c.UserID),
+			)
+			h.evict(c)
+		}
+	}
 }
+
+// safeSend enqueues msg on the client's send channel without blocking.
+// Drops the frame (with a warning) if the buffer is full.
+func (h *Hub) safeSend(client *Client, msg []byte) {
+	select {
+	case client.send <- msg:
+	default:
+		h.log.Warn("targeted send dropped, buffer full",
+			zap.String("clientID", client.ID),
+		)
+	}
+}
+
+// evict closes the client's send channel and removes it from all rooms and the
+// clients map. Must be called from Hub.Run() only.
+func (h *Hub) evict(client *Client) {
+	for roomID := range client.rooms {
+		h.removeFromRoom(client, roomID)
+	}
+	delete(h.clients, client.ID)
+	close(client.send)
+}
+
+// removeFromRoom removes client from one room. Deletes the room when it
+// becomes empty. Does NOT close client.send.
+func (h *Hub) removeFromRoom(client *Client, roomID string) {
+	if members, ok := h.rooms[roomID]; ok {
+		delete(members, client.ID)
+		if len(members) == 0 {
+			delete(h.rooms, roomID)
+		}
+	}
+	delete(client.rooms, roomID)
+}
+
+// ClientCount returns the number of active connections (for metrics / tests).
+// Must be called from Hub.Run()'s goroutine.
+func (h *Hub) ClientCount() int { return len(h.clients) }
+
+// RoomCount returns the number of active rooms (for metrics / tests).
+// Must be called from Hub.Run()'s goroutine.
+func (h *Hub) RoomCount() int { return len(h.rooms) }
