@@ -3,6 +3,7 @@ package ws
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -10,33 +11,33 @@ import (
 )
 
 const (
-	writeWait      = 10 * time.Second    // max time to write a message
-	pongWait       = 60 * time.Second    // max time to wait for pong
-	pingPeriod     = (pongWait * 9) / 10 // must be < pongWait
-	maxMessageSize = 4096                 // bytes
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 4096
 )
 
-// Client represents a single WebSocket connection.
+// Client represents a single authenticated WebSocket connection.
 //
 // Concurrency model:
-//   - readPump runs in one dedicated goroutine.
-//   - writePump runs in another dedicated goroutine.
-//   - The two pumps communicate only through the hub (via channels),
-//     never sharing state with each other directly.
-//   - conn.WriteMessage is called only from writePump → no concurrent writes.
-//   - conn.ReadMessage is called only from readPump  → no concurrent reads.
+//   - ReadPump runs in one dedicated goroutine; it is the only reader of conn.
+//   - WritePump runs in another dedicated goroutine; it is the only writer of conn.
+//   - client.rooms is owned by Hub.Run() and must never be accessed from
+//     ReadPump or WritePump directly — all mutations flow through hub channels.
 type Client struct {
-	// ID uniquely identifies this connection across the hub.
+	// ID is the unique connection identifier (differs from UserID for multi-device).
 	ID string
+	// UserID is the authenticated identity of the connected user.
+	UserID string
+
+	// rooms tracks which rooms this client has joined.
+	// Owned exclusively by Hub.Run(); must not be touched outside that goroutine.
+	rooms map[string]struct{}
 
 	hub  *Hub
 	conn *websocket.Conn
-
-	// send is a buffered channel of outbound messages.
-	// Owned by writePump; written to by Hub.Run only.
 	send chan []byte
-
-	log *zap.Logger
+	log  *zap.Logger
 }
 
 func newClientID() string {
@@ -45,20 +46,21 @@ func newClientID() string {
 	return hex.EncodeToString(b)
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn, log *zap.Logger) *Client {
+// NewClient constructs a Client for the given WebSocket connection and user.
+func NewClient(hub *Hub, conn *websocket.Conn, userID string, log *zap.Logger) *Client {
 	return &Client{
-		ID:   newClientID(),
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, 256),
-		log:  log,
+		ID:     newClientID(),
+		UserID: userID,
+		rooms:  make(map[string]struct{}),
+		hub:    hub,
+		conn:   conn,
+		send:   make(chan []byte, 256),
+		log:    log,
 	}
 }
 
-// ReadPump pumps messages from the WebSocket connection to the hub.
-//
-// One goroutine per client. Exits on read error or close, then
-// unregisters the client from the hub.
+// ReadPump pumps inbound WebSocket frames to the hub.
+// One goroutine per client; unregisters on exit.
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister <- c
@@ -72,24 +74,26 @@ func (c *Client) ReadPump() {
 	})
 
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err,
 				websocket.CloseGoingAway,
 				websocket.CloseAbnormalClosure,
 			) {
-				c.log.Warn("unexpected close", zap.String("id", c.ID), zap.Error(err))
+				c.log.Warn("unexpected close",
+					zap.String("clientID", c.ID),
+					zap.String("userID", c.UserID),
+					zap.Error(err),
+				)
 			}
-			break
+			return
 		}
-		c.hub.Broadcast <- message
+		c.route(raw)
 	}
 }
 
-// WritePump pumps messages from the client's send channel to the WebSocket.
-//
-// One goroutine per client. A ticker sends periodic pings to detect
-// dead connections. Exits when the send channel is closed by the hub.
+// WritePump pumps outbound messages from the send channel to the WebSocket.
+// One goroutine per client; sends a close frame when the hub closes send.
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -99,10 +103,10 @@ func (c *Client) WritePump() {
 
 	for {
 		select {
-		case message, ok := <-c.send:
+		case msg, ok := <-c.send:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				// Hub closed the channel — send a close frame.
+				// Hub closed the channel — send a close frame and exit.
 				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
@@ -111,16 +115,14 @@ func (c *Client) WritePump() {
 			if err != nil {
 				return
 			}
-			_, _ = w.Write(message)
+			_, _ = w.Write(msg)
 
-			// Flush any queued messages in the same write frame.
+			// Batch any already-queued messages into the same write frame.
 			n := len(c.send)
 			for range n {
 				_, _ = w.Write([]byte{'\n'})
-				msg := <-c.send
-				_, _ = w.Write(msg)
+				_, _ = w.Write(<-c.send)
 			}
-
 			if err := w.Close(); err != nil {
 				return
 			}
@@ -131,5 +133,73 @@ func (c *Client) WritePump() {
 				return
 			}
 		}
+	}
+}
+
+// route parses an inbound frame and dispatches to the appropriate hub channel.
+func (c *Client) route(raw []byte) {
+	var env Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		c.log.Debug("malformed envelope",
+			zap.String("clientID", c.ID),
+			zap.Error(err),
+		)
+		c.sendErr("bad_request", "invalid JSON envelope")
+		return
+	}
+
+	switch env.Event {
+	case EventJoin:
+		var p JoinPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil || p.RoomID == "" {
+			c.sendErr("bad_request", "join requires a non-empty room_id in payload")
+			return
+		}
+		c.hub.Join <- joinCmd{client: c, roomID: p.RoomID}
+
+	case EventLeave:
+		var p LeavePayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil || p.RoomID == "" {
+			c.sendErr("bad_request", "leave requires a non-empty room_id in payload")
+			return
+		}
+		c.hub.Leave <- leaveCmd{client: c, roomID: p.RoomID}
+
+	case EventMessage:
+		if env.RoomID == "" {
+			c.sendErr("bad_request", "message requires a non-empty room_id in the envelope")
+			return
+		}
+		var p SendPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil || p.Message == "" {
+			c.sendErr("bad_request", "message requires a non-empty message in payload")
+			return
+		}
+		chat := ChatMessage{
+			SenderID:  c.UserID,
+			RoomID:    env.RoomID,
+			Message:   p.Message,
+			CreatedAt: time.Now().UTC(),
+		}
+		c.hub.Broadcast <- roomcast{
+			roomID: env.RoomID,
+			msg:    buildEnvelope(EventMessage, env.RoomID, chat),
+			sender: c,
+		}
+
+	default:
+		c.sendErr("unknown_event", "unrecognised event type: "+string(env.Event))
+	}
+}
+
+// sendErr enqueues an error frame; drops silently if the send buffer is full.
+func (c *Client) sendErr(code, message string) {
+	frame := buildEnvelope(EventError, "", ErrorPayload{Code: code, Message: message})
+	select {
+	case c.send <- frame:
+	default:
+		c.log.Warn("send buffer full; dropping error frame",
+			zap.String("clientID", c.ID),
+		)
 	}
 }
