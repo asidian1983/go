@@ -1,6 +1,12 @@
 package ws
 
-import "go.uber.org/zap"
+import (
+	"context"
+
+	"go.uber.org/zap"
+
+	redispubsub "github.com/asidian1983/chat-server/internal/infrastructure/redis"
+)
 
 // ---------- Internal command types ----------
 // All Hub state mutations are serialised through channels so that Hub.Run()
@@ -34,11 +40,27 @@ type roomcast struct {
 //     happens through buffered channels, making the API goroutine-safe by
 //     construction.
 //
-// Message flow:
+// Message flow (single-node):
 //
 //	Client.ReadPump ──► hub.Join / hub.Leave / hub.Broadcast
 //	                              │
 //	                         Hub.Run()
+//	                              │
+//	                       fanout(roomID)
+//	                              │
+//	               client.send ──► Client.WritePump ──► WebSocket
+//
+// Message flow (multi-node with Redis):
+//
+//	Client.ReadPump ──► hub.Broadcast
+//	                              │
+//	                         Hub.Run()
+//	                              │
+//	                      Redis PUBLISH
+//	                              │
+//	              (all nodes) Redis SUBSCRIBE
+//	                              │
+//	                    Hub.remoteDeliver
 //	                              │
 //	                       fanout(roomID)
 //	                              │
@@ -55,12 +77,19 @@ type Hub struct {
 	Leave      chan leaveCmd
 	Broadcast  chan roomcast
 
+	// pubsub is optional; nil means single-node mode (no Redis).
+	pubsub *redispubsub.Manager
+	// remoteDeliver receives messages forwarded from Redis by a bridge goroutine.
+	// It is a nil channel when pubsub is nil, so it never fires in select.
+	remoteDeliver chan roomcast
+
 	log *zap.Logger
 }
 
 // NewHub constructs a Hub ready to be started with Run().
-func NewHub(log *zap.Logger) *Hub {
-	return &Hub{
+// Pass a non-nil pubsub to enable Redis-backed horizontal scaling.
+func NewHub(log *zap.Logger, pubsub *redispubsub.Manager) *Hub {
+	h := &Hub{
 		clients:    make(map[string]*Client),
 		rooms:      make(map[string]map[string]*Client),
 		Register:   make(chan *Client, 256),
@@ -68,14 +97,33 @@ func NewHub(log *zap.Logger) *Hub {
 		Join:       make(chan joinCmd, 256),
 		Leave:      make(chan leaveCmd, 256),
 		Broadcast:  make(chan roomcast, 512),
+		pubsub:     pubsub,
 		log:        log,
 	}
+	if pubsub != nil {
+		h.remoteDeliver = make(chan roomcast, 512)
+	}
+	return h
 }
 
 // Run starts the hub event loop. Must be called in its own goroutine.
 // It exits cleanly when stop is closed.
 func (h *Hub) Run(stop <-chan struct{}) {
-	h.log.Info("hub started")
+	// Bridge goroutine: forwards Redis deliveries into h.remoteDeliver so the
+	// Hub event loop remains a single-goroutine actor.
+	if h.pubsub != nil {
+		go func() {
+			for d := range h.pubsub.Deliver() {
+				select {
+				case h.remoteDeliver <- roomcast{roomID: d.RoomID, msg: d.Payload}:
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
+
+	h.log.Info("hub started", zap.Bool("redis", h.pubsub != nil))
 	for {
 		select {
 
@@ -106,11 +154,17 @@ func (h *Hub) Run(stop <-chan struct{}) {
 					AckPayload{OK: true, Message: "already in room"}))
 				break
 			}
-			if h.rooms[cmd.roomID] == nil {
+			isNewRoom := h.rooms[cmd.roomID] == nil
+			if isNewRoom {
 				h.rooms[cmd.roomID] = make(map[string]*Client)
 			}
 			h.rooms[cmd.roomID][cmd.client.ID] = cmd.client
 			cmd.client.rooms[cmd.roomID] = struct{}{}
+
+			// Subscribe to Redis when this is the first local client in the room.
+			if isNewRoom && h.pubsub != nil {
+				h.pubsub.Subscribe(cmd.roomID)
+			}
 
 			// Notify existing members (excluding the joiner).
 			h.fanout(cmd.roomID,
@@ -173,8 +227,26 @@ func (h *Hub) Run(stop <-chan struct{}) {
 					break
 				}
 			}
-			// Deliver to ALL members including sender (echo-back = delivery confirmation).
-			h.fanout(cast.roomID, cast.msg, nil)
+			if h.pubsub != nil {
+				// Publish to Redis; every subscribed node (including this one)
+				// will receive it via remoteDeliver and fanout locally.
+				if err := h.pubsub.Publish(context.Background(), cast.roomID, cast.msg); err != nil {
+					h.log.Error("redis publish failed, falling back to local fanout",
+						zap.String("room", cast.roomID), zap.Error(err))
+					h.fanout(cast.roomID, cast.msg, nil)
+				}
+			} else {
+				// Single-node: deliver directly.
+				h.fanout(cast.roomID, cast.msg, nil)
+			}
+
+		// ── Remote delivery (from Redis) ─────────────────────────────────────
+		case cast := <-h.remoteDeliver:
+			// Message arrived from another node (or echoed back from Redis).
+			// Fan out to all LOCAL members of the room.
+			if _, ok := h.rooms[cast.roomID]; ok {
+				h.fanout(cast.roomID, cast.msg, nil)
+			}
 
 		// ── Shutdown ─────────────────────────────────────────────────────────
 		case <-stop:
@@ -229,12 +301,16 @@ func (h *Hub) evict(client *Client) {
 }
 
 // removeFromRoom removes client from one room. Deletes the room when it
-// becomes empty. Does NOT close client.send.
+// becomes empty and unsubscribes from Redis if enabled. Does NOT close client.send.
 func (h *Hub) removeFromRoom(client *Client, roomID string) {
 	if members, ok := h.rooms[roomID]; ok {
 		delete(members, client.ID)
 		if len(members) == 0 {
 			delete(h.rooms, roomID)
+			// No local clients remain — stop receiving Redis messages for this room.
+			if h.pubsub != nil {
+				h.pubsub.Unsubscribe(roomID)
+			}
 		}
 	}
 	delete(client.rooms, roomID)
