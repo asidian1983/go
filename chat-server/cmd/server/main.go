@@ -11,6 +11,7 @@ import (
 	httpadapter "github.com/asidian1983/chat-server/internal/adapter/http"
 	wsadapter "github.com/asidian1983/chat-server/internal/adapter/ws"
 	"github.com/asidian1983/chat-server/internal/infrastructure/config"
+	redispubsub "github.com/asidian1983/chat-server/internal/infrastructure/redis"
 	"github.com/asidian1983/chat-server/pkg/logger"
 )
 
@@ -26,8 +27,18 @@ func main() {
 	}
 	defer log.Sync() //nolint:errcheck
 
+	// Redis Pub/Sub (optional — disabled when redis.enabled = false)
+	var rps *redispubsub.Manager
+	if cfg.Redis.Enabled {
+		rps = redispubsub.New(cfg.Redis.Addr, log)
+		redisStop := make(chan struct{})
+		go rps.Run(redisStop)
+		defer close(redisStop)
+		log.Info("redis pubsub enabled", zap.String("addr", cfg.Redis.Addr))
+	}
+
 	// Hub: start event loop in background, stop on shutdown
-	hub := wsadapter.NewHub(log)
+	hub := wsadapter.NewHub(log, rps)
 	hubStop := make(chan struct{})
 	go hub.Run(hubStop)
 

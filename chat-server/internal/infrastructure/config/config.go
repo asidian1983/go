@@ -10,6 +10,12 @@ import (
 type Config struct {
 	Env    string
 	Server ServerConfig
+	Redis  RedisConfig
+}
+
+type RedisConfig struct {
+	Enabled bool
+	Addr    string
 }
 
 type ServerConfig struct {
@@ -42,7 +48,14 @@ func Load() (*Config, error) {
 
 	cfg := &Config{}
 
+	v.SetDefault("redis.enabled", false)
+	v.SetDefault("redis.addr", "localhost:6379")
+
 	cfg.Env = v.GetString("env")
+	cfg.Redis = RedisConfig{
+		Enabled: v.GetBool("redis.enabled"),
+		Addr:    v.GetString("redis.addr"),
+	}
 	cfg.Server = ServerConfig{
 		Port:            v.GetString("server.port"),
 		ReadTimeout:     v.GetDuration("server.read_timeout"),
