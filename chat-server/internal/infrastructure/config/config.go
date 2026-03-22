@@ -9,10 +9,16 @@ import (
 )
 
 type Config struct {
-	Env    string
-	Server ServerConfig
-	Redis  RedisConfig
-	JWT    JWTConfig
+	Env      string
+	Server   ServerConfig
+	Redis    RedisConfig
+	JWT      JWTConfig
+	Postgres PostgresConfig
+}
+
+type PostgresConfig struct {
+	Enabled bool
+	DSN     string
 }
 
 type JWTConfig struct {
@@ -45,6 +51,8 @@ func Load() (*Config, error) {
 	v.SetDefault("redis.enabled", false)
 	v.SetDefault("redis.addr", "localhost:6379")
 	v.SetDefault("jwt.expiry", "24h")
+	v.SetDefault("postgres.enabled", false)
+	v.SetDefault("postgres.dsn", "postgres://localhost:5432/chat?sslmode=disable")
 	// jwt.secret has no default — it MUST be set explicitly.
 
 	v.SetConfigName("config")
@@ -75,6 +83,10 @@ func Load() (*Config, error) {
 	cfg.JWT = JWTConfig{
 		Secret: v.GetString("jwt.secret"),
 		Expiry: v.GetDuration("jwt.expiry"),
+	}
+	cfg.Postgres = PostgresConfig{
+		Enabled: v.GetBool("postgres.enabled"),
+		DSN:     v.GetString("postgres.dsn"),
 	}
 
 	if cfg.JWT.Secret == "" {

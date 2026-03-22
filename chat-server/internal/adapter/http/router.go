@@ -10,10 +10,11 @@ import (
 )
 
 type Router struct {
-	health *HealthHandler
-	auth   *AuthHandler
-	ws     wsHandler
-	jwt    *auth.Service
+	health   *HealthHandler
+	auth     *AuthHandler
+	messages *MessageHandler
+	ws       wsHandler
+	jwt      *auth.Service
 }
 
 // wsHandler is a narrow interface so the router does not import the ws package directly.
@@ -21,8 +22,8 @@ type wsHandler interface {
 	ServeWS(c *gin.Context)
 }
 
-func NewRouter(health *HealthHandler, authH *AuthHandler, ws wsHandler, jwt *auth.Service) *Router {
-	return &Router{health: health, auth: authH, ws: ws, jwt: jwt}
+func NewRouter(health *HealthHandler, authH *AuthHandler, messages *MessageHandler, ws wsHandler, jwt *auth.Service) *Router {
+	return &Router{health: health, auth: authH, messages: messages, ws: ws, jwt: jwt}
 }
 
 func (r *Router) Register(engine *gin.Engine) {
@@ -37,6 +38,9 @@ func (r *Router) Register(engine *gin.Engine) {
 	protected.Use(middleware.JWT(r.jwt))
 	{
 		protected.GET("/ws", r.ws.ServeWS)
+		if r.messages != nil {
+			protected.GET("/rooms/:id/messages", r.messages.History)
+		}
 	}
 
 	engine.NoRoute(func(c *gin.Context) {

@@ -2,9 +2,12 @@ package ws
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/asidian1983/chat-server/internal/domain/entity"
+	"github.com/asidian1983/chat-server/internal/domain/repository"
 	redispubsub "github.com/asidian1983/chat-server/internal/infrastructure/redis"
 )
 
@@ -25,10 +28,12 @@ type leaveCmd struct {
 // roomcast delivers msg to every member of roomID.
 // sender is the originating client (used for authorisation); nil means a
 // server-generated broadcast that skips the membership check.
+// message is set for user chat messages and used for persistence; nil for system events.
 type roomcast struct {
-	roomID string
-	msg    []byte
-	sender *Client
+	roomID  string
+	msg     []byte
+	sender  *Client
+	message *entity.Message
 }
 
 // Hub is the central, room-aware connection manager.
@@ -83,12 +88,16 @@ type Hub struct {
 	// It is a nil channel when pubsub is nil, so it never fires in select.
 	remoteDeliver chan roomcast
 
+	// msgRepo is optional; nil means messages are not persisted.
+	msgRepo repository.MessageRepository
+
 	log *zap.Logger
 }
 
 // NewHub constructs a Hub ready to be started with Run().
 // Pass a non-nil pubsub to enable Redis-backed horizontal scaling.
-func NewHub(log *zap.Logger, pubsub *redispubsub.Manager) *Hub {
+// Pass a non-nil msgRepo to enable message persistence.
+func NewHub(log *zap.Logger, pubsub *redispubsub.Manager, msgRepo repository.MessageRepository) *Hub {
 	h := &Hub{
 		clients:    make(map[string]*Client),
 		rooms:      make(map[string]map[string]*Client),
@@ -98,6 +107,7 @@ func NewHub(log *zap.Logger, pubsub *redispubsub.Manager) *Hub {
 		Leave:      make(chan leaveCmd, 256),
 		Broadcast:  make(chan roomcast, 512),
 		pubsub:     pubsub,
+		msgRepo:    msgRepo,
 		log:        log,
 	}
 	if pubsub != nil {
@@ -239,6 +249,10 @@ func (h *Hub) Run(stop <-chan struct{}) {
 				// Single-node: deliver directly.
 				h.fanout(cast.roomID, cast.msg, nil)
 			}
+			// Persist asynchronously — must not block the hub event loop.
+			if h.msgRepo != nil && cast.message != nil {
+				go h.persistMessage(cast.message)
+			}
 
 		// ── Remote delivery (from Redis) ─────────────────────────────────────
 		case cast := <-h.remoteDeliver:
@@ -314,6 +328,20 @@ func (h *Hub) removeFromRoom(client *Client, roomID string) {
 		}
 	}
 	delete(client.rooms, roomID)
+}
+
+// persistMessage saves a chat message to the repository.
+// Runs in its own goroutine so it never blocks the hub event loop.
+func (h *Hub) persistMessage(msg *entity.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.msgRepo.Save(ctx, msg); err != nil {
+		h.log.Error("message persist failed",
+			zap.String("id", msg.ID),
+			zap.String("roomID", string(msg.RoomID)),
+			zap.Error(err),
+		)
+	}
 }
 
 // ClientCount returns the number of active connections (for metrics / tests).

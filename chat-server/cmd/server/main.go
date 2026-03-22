@@ -10,8 +10,10 @@ import (
 
 	httpadapter "github.com/asidian1983/chat-server/internal/adapter/http"
 	wsadapter "github.com/asidian1983/chat-server/internal/adapter/ws"
+	"github.com/asidian1983/chat-server/internal/domain/repository"
 	"github.com/asidian1983/chat-server/internal/infrastructure/auth"
 	"github.com/asidian1983/chat-server/internal/infrastructure/config"
+	"github.com/asidian1983/chat-server/internal/infrastructure/postgres"
 	redispubsub "github.com/asidian1983/chat-server/internal/infrastructure/redis"
 	"github.com/asidian1983/chat-server/pkg/logger"
 )
@@ -53,16 +55,32 @@ func main() {
 		log.Info("redis pubsub enabled", zap.String("addr", cfg.Redis.Addr))
 	}
 
+	// ── Postgres (optional) ───────────────────────────────────────────────────
+	var msgRepo repository.MessageRepository
+	if cfg.Postgres.Enabled {
+		pool, err := postgres.Open(context.Background(), cfg.Postgres.DSN)
+		if err != nil {
+			panic("failed to connect to postgres: " + err.Error())
+		}
+		defer pool.Close()
+		msgRepo = postgres.NewMessageRepo(pool)
+		log.Info("postgres enabled", zap.String("dsn", cfg.Postgres.DSN))
+	}
+
 	// ── Hub ───────────────────────────────────────────────────────────────────
-	hub := wsadapter.NewHub(log, rps)
+	hub := wsadapter.NewHub(log, rps, msgRepo)
 	hubStop := make(chan struct{})
 	go hub.Run(hubStop)
 
 	// ── HTTP wiring ───────────────────────────────────────────────────────────
 	healthHandler := httpadapter.NewHealthHandler()
 	authHandler := httpadapter.NewAuthHandler(demoUsers, jwtSvc, log)
+	var messagesHandler *httpadapter.MessageHandler
+	if msgRepo != nil {
+		messagesHandler = httpadapter.NewMessageHandler(msgRepo, log)
+	}
 	wsHandler := wsadapter.NewHandler(hub, log)
-	router := httpadapter.NewRouter(healthHandler, authHandler, wsHandler, jwtSvc)
+	router := httpadapter.NewRouter(healthHandler, authHandler, messagesHandler, wsHandler, jwtSvc)
 	server := httpadapter.NewServer(cfg, router, log)
 
 	// ── Start ─────────────────────────────────────────────────────────────────
