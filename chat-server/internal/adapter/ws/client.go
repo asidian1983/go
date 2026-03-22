@@ -8,6 +8,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	"github.com/asidian1983/chat-server/internal/domain/entity"
 )
 
 const (
@@ -175,16 +177,27 @@ func (c *Client) route(raw []byte) {
 			c.sendErr("bad_request", "message requires a non-empty message in payload")
 			return
 		}
+		msgID := newClientID() // reuse same random-hex generator for message IDs
+		now := time.Now().UTC()
 		chat := ChatMessage{
+			ID:        msgID,
 			SenderID:  c.UserID,
 			RoomID:    env.RoomID,
 			Message:   p.Message,
-			CreatedAt: time.Now().UTC(),
+			CreatedAt: now,
 		}
 		c.hub.Broadcast <- roomcast{
 			roomID: env.RoomID,
 			msg:    buildEnvelope(EventMessage, env.RoomID, chat),
 			sender: c,
+			message: &entity.Message{
+				ID:        msgID,
+				RoomID:    entity.RoomID(env.RoomID),
+				SenderID:  entity.UserID(c.UserID),
+				Type:      entity.MsgTypeChat,
+				Body:      p.Message,
+				CreatedAt: now,
+			},
 		}
 
 	default:

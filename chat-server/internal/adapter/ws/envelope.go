@@ -49,7 +49,9 @@ type SendPayload struct {
 
 // ChatMessage is the authoritative message record delivered to every room member,
 // including the original sender (echo-back pattern for delivery confirmation).
+// ID is stable across history queries and can be used for client-side deduplication.
 type ChatMessage struct {
+	ID        string    `json:"id"`
 	SenderID  string    `json:"sender_id"`
 	RoomID    string    `json:"room_id"`
 	Message   string    `json:"message"`
