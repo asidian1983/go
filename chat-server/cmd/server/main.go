@@ -10,6 +10,7 @@ import (
 
 	httpadapter "github.com/asidian1983/chat-server/internal/adapter/http"
 	wsadapter "github.com/asidian1983/chat-server/internal/adapter/ws"
+	"github.com/asidian1983/chat-server/internal/infrastructure/auth"
 	"github.com/asidian1983/chat-server/internal/infrastructure/config"
 	redispubsub "github.com/asidian1983/chat-server/internal/infrastructure/redis"
 	"github.com/asidian1983/chat-server/pkg/logger"
@@ -27,7 +28,22 @@ func main() {
 	}
 	defer log.Sync() //nolint:errcheck
 
-	// Redis Pub/Sub (optional — disabled when redis.enabled = false)
+	// ── Auth ──────────────────────────────────────────────────────────────────
+	jwtSvc, err := auth.NewService(cfg.JWT.Secret, cfg.JWT.Expiry)
+	if err != nil {
+		panic("failed to init jwt: " + err.Error())
+	}
+
+	// Demo user store — replace with a database-backed implementation in production.
+	demoUsers, err := auth.NewUserStore(map[string]string{
+		"alice": "password",
+		"bob":   "password",
+	})
+	if err != nil {
+		panic("failed to init user store: " + err.Error())
+	}
+
+	// ── Redis Pub/Sub (optional) ──────────────────────────────────────────────
 	var rps *redispubsub.Manager
 	if cfg.Redis.Enabled {
 		rps = redispubsub.New(cfg.Redis.Addr, log)
@@ -37,24 +53,24 @@ func main() {
 		log.Info("redis pubsub enabled", zap.String("addr", cfg.Redis.Addr))
 	}
 
-	// Hub: start event loop in background, stop on shutdown
+	// ── Hub ───────────────────────────────────────────────────────────────────
 	hub := wsadapter.NewHub(log, rps)
 	hubStop := make(chan struct{})
 	go hub.Run(hubStop)
 
-	// Wire dependencies
+	// ── HTTP wiring ───────────────────────────────────────────────────────────
 	healthHandler := httpadapter.NewHealthHandler()
+	authHandler := httpadapter.NewAuthHandler(demoUsers, jwtSvc, log)
 	wsHandler := wsadapter.NewHandler(hub, log)
-	router := httpadapter.NewRouter(healthHandler, wsHandler)
+	router := httpadapter.NewRouter(healthHandler, authHandler, wsHandler, jwtSvc)
 	server := httpadapter.NewServer(cfg, router, log)
 
-	// Start server in background
+	// ── Start ─────────────────────────────────────────────────────────────────
 	serverErr := make(chan error, 1)
 	go func() {
 		serverErr <- server.Run()
 	}()
 
-	// Wait for interrupt or server error
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -65,7 +81,7 @@ func main() {
 		log.Info("received signal", zap.String("signal", sig.String()))
 	}
 
-	// Graceful shutdown
+	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 
@@ -73,6 +89,6 @@ func main() {
 		log.Fatal("forced shutdown", zap.Error(err))
 	}
 
-	close(hubStop) // stop hub after HTTP connections are drained
+	close(hubStop)
 	log.Info("server exited")
 }

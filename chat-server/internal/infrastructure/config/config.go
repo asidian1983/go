@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -11,6 +12,14 @@ type Config struct {
 	Env    string
 	Server ServerConfig
 	Redis  RedisConfig
+	JWT    JWTConfig
+}
+
+type JWTConfig struct {
+	// Secret must be at least 32 characters. Set via APP_JWT_SECRET env var.
+	Secret string
+	// Expiry controls token lifetime. Default: 24h.
+	Expiry time.Duration
 }
 
 type RedisConfig struct {
@@ -33,6 +42,10 @@ func Load() (*Config, error) {
 	v.SetDefault("server.read_timeout", "10s")
 	v.SetDefault("server.write_timeout", "10s")
 	v.SetDefault("server.shutdown_timeout", "15s")
+	v.SetDefault("redis.enabled", false)
+	v.SetDefault("redis.addr", "localhost:6379")
+	v.SetDefault("jwt.expiry", "24h")
+	// jwt.secret has no default — it MUST be set explicitly.
 
 	v.SetConfigName("config")
 	v.SetConfigType("yaml")
@@ -48,19 +61,24 @@ func Load() (*Config, error) {
 
 	cfg := &Config{}
 
-	v.SetDefault("redis.enabled", false)
-	v.SetDefault("redis.addr", "localhost:6379")
-
 	cfg.Env = v.GetString("env")
-	cfg.Redis = RedisConfig{
-		Enabled: v.GetBool("redis.enabled"),
-		Addr:    v.GetString("redis.addr"),
-	}
 	cfg.Server = ServerConfig{
 		Port:            v.GetString("server.port"),
 		ReadTimeout:     v.GetDuration("server.read_timeout"),
 		WriteTimeout:    v.GetDuration("server.write_timeout"),
 		ShutdownTimeout: v.GetDuration("server.shutdown_timeout"),
+	}
+	cfg.Redis = RedisConfig{
+		Enabled: v.GetBool("redis.enabled"),
+		Addr:    v.GetString("redis.addr"),
+	}
+	cfg.JWT = JWTConfig{
+		Secret: v.GetString("jwt.secret"),
+		Expiry: v.GetDuration("jwt.expiry"),
+	}
+
+	if cfg.JWT.Secret == "" {
+		return nil, errors.New("config: APP_JWT_SECRET must be set (min 32 characters)")
 	}
 
 	return cfg, nil

@@ -4,11 +4,16 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/asidian1983/chat-server/internal/adapter/http/middleware"
+	"github.com/asidian1983/chat-server/internal/infrastructure/auth"
 )
 
 type Router struct {
 	health *HealthHandler
+	auth   *AuthHandler
 	ws     wsHandler
+	jwt    *auth.Service
 }
 
 // wsHandler is a narrow interface so the router does not import the ws package directly.
@@ -16,21 +21,24 @@ type wsHandler interface {
 	ServeWS(c *gin.Context)
 }
 
-func NewRouter(health *HealthHandler, ws wsHandler) *Router {
-	return &Router{health: health, ws: ws}
+func NewRouter(health *HealthHandler, authH *AuthHandler, ws wsHandler, jwt *auth.Service) *Router {
+	return &Router{health: health, auth: authH, ws: ws, jwt: jwt}
 }
 
 func (r *Router) Register(engine *gin.Engine) {
-	// Global middleware
 	engine.Use(gin.Recovery())
 
-	// Ops endpoints — no auth required
+	// Public endpoints — no auth required
 	engine.GET("/health", r.health.Check)
+	engine.POST("/auth/login", r.auth.Login)
 
-	// WebSocket endpoint
-	engine.GET("/ws", r.ws.ServeWS)
+	// Protected endpoints — JWT required
+	protected := engine.Group("/")
+	protected.Use(middleware.JWT(r.jwt))
+	{
+		protected.GET("/ws", r.ws.ServeWS)
+	}
 
-	// 404 handler
 	engine.NoRoute(func(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 	})

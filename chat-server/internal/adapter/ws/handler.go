@@ -2,11 +2,12 @@ package ws
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	"github.com/asidian1983/chat-server/internal/adapter/http/middleware"
 )
 
 var upgrader = websocket.Upgrader{
@@ -29,13 +30,14 @@ func NewHandler(hub *Hub, log *zap.Logger) *Handler {
 
 // ServeWS upgrades the connection to WebSocket and starts the client pumps.
 //
-// Requires ?user_id=<id> query parameter.
-// In production, replace this with JWT validation in middleware and read the
-// authenticated identity from gin.Context (e.g. c.GetString("userID")).
+// The JWT middleware (applied at the router level) has already validated the
+// token and stored the authenticated userID in gin.Context before this handler
+// is called. No token handling is done here.
 func (h *Handler) ServeWS(c *gin.Context) {
-	userID := strings.TrimSpace(c.Query("user_id"))
-	if userID == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id query parameter is required"})
+	userID, ok := c.Get(middleware.UserIDKey)
+	if !ok {
+		// Should never happen if the JWT middleware is correctly applied.
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
 		return
 	}
 
@@ -45,7 +47,7 @@ func (h *Handler) ServeWS(c *gin.Context) {
 		return
 	}
 
-	client := NewClient(h.hub, conn, userID, h.log)
+	client := NewClient(h.hub, conn, userID.(string), h.log)
 	h.hub.Register <- client
 
 	h.log.Info("new websocket connection",
