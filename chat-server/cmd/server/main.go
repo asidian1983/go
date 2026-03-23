@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,11 +48,10 @@ func main() {
 
 	// ── Redis Pub/Sub (optional) ──────────────────────────────────────────────
 	var rps *redispubsub.Manager
+	redisStop := make(chan struct{})
 	if cfg.Redis.Enabled {
 		rps = redispubsub.New(cfg.Redis.Addr, log)
-		redisStop := make(chan struct{})
 		go rps.Run(redisStop)
-		defer close(redisStop)
 		log.Info("redis pubsub enabled", zap.String("addr", cfg.Redis.Addr))
 	}
 
@@ -63,17 +63,22 @@ func main() {
 		if err != nil {
 			panic("failed to connect to postgres: " + err.Error())
 		}
-		defer pool.Close()
+		defer pool.Close() // safe: closed only after hubDone (see shutdown below)
 		repo := postgres.NewMessageRepo(pool)
 		msgRepo = repo
 		readRepo = repo
-		log.Info("postgres enabled", zap.String("dsn", cfg.Postgres.DSN))
+		// Redact password before logging (HIGH-7).
+		log.Info("postgres enabled", zap.String("dsn", redactDSN(cfg.Postgres.DSN)))
 	}
 
 	// ── Hub ───────────────────────────────────────────────────────────────────
 	hub := wsadapter.NewHub(log, rps, msgRepo, readRepo)
 	hubStop := make(chan struct{})
-	go hub.Run(hubStop)
+	hubDone := make(chan struct{})
+	go func() {
+		hub.Run(hubStop)
+		close(hubDone)
+	}()
 
 	// ── HTTP wiring ───────────────────────────────────────────────────────────
 	healthHandler := httpadapter.NewHealthHandler()
@@ -82,7 +87,7 @@ func main() {
 	if msgRepo != nil {
 		messagesHandler = httpadapter.NewMessageHandler(msgRepo, log)
 	}
-	wsHandler := wsadapter.NewHandler(hub, log)
+	wsHandler := wsadapter.NewHandler(hub, cfg.Server.AllowedOrigins, log)
 	router := httpadapter.NewRouter(healthHandler, authHandler, messagesHandler, wsHandler, jwtSvc)
 	server := httpadapter.NewServer(cfg, router, log)
 
@@ -102,14 +107,36 @@ func main() {
 		log.Info("received signal", zap.String("signal", sig.String()))
 	}
 
-	// ── Graceful shutdown ─────────────────────────────────────────────────────
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
+	// ── Graceful shutdown (CRITICAL-2: ordered teardown) ──────────────────────
+	// Order:
+	//   1. Stop accepting new HTTP/WS connections (drains in-flight HTTP requests).
+	//   2. Stop the Hub event loop; wait for it to finish all in-flight DB writes.
+	//   3. Stop Redis (hub is idle — no more publishes in flight).
+	//   4. pool.Close() via defer (safe: hubDone guarantees no active DB calls).
+	shutCtx, cancel := context.WithTimeout(context.Background(), cfg.Server.ShutdownTimeout)
 	defer cancel()
 
-	if err := server.Shutdown(ctx); err != nil {
-		log.Fatal("forced shutdown", zap.Error(err))
+	if err := server.Shutdown(shutCtx); err != nil {
+		// LOW-1: use Error, not Fatal — deferred cleanup must still run.
+		log.Error("HTTP server forced shutdown", zap.Error(err))
 	}
 
 	close(hubStop)
+	<-hubDone // blocks until Hub.Run() returns (including persistWG.Wait())
+
+	close(redisStop) // stop Redis after hub is fully idle
+
 	log.Info("server exited")
+}
+
+// redactDSN returns the DSN with the password stripped for safe logging.
+func redactDSN(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "[unparseable DSN]"
+	}
+	if u.User != nil {
+		u.User = url.User(u.User.Username()) // keep username, drop password
+	}
+	return u.String()
 }

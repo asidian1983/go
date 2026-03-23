@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -100,6 +101,11 @@ type Hub struct {
 	// readRepo is optional; nil means read receipts are not persisted.
 	readRepo repository.ReadRepository
 
+	// persistWG tracks in-flight async persistence goroutines.
+	// Hub.Run() waits for all of them to finish before returning,
+	// ensuring no DB writes are abandoned when the pool is closed.
+	persistWG sync.WaitGroup
+
 	log *zap.Logger
 }
 
@@ -129,7 +135,8 @@ func NewHub(log *zap.Logger, pubsub *redispubsub.Manager, msgRepo repository.Mes
 }
 
 // Run starts the hub event loop. Must be called in its own goroutine.
-// It exits cleanly when stop is closed.
+// It exits cleanly when stop is closed, waiting for all in-flight
+// persistence goroutines to complete before returning.
 func (h *Hub) Run(stop <-chan struct{}) {
 	// Bridge goroutine: forwards Redis deliveries into h.remoteDeliver so the
 	// Hub event loop remains a single-goroutine actor.
@@ -263,7 +270,11 @@ func (h *Hub) Run(stop <-chan struct{}) {
 			}
 			// Persist asynchronously — must not block the hub event loop.
 			if h.msgRepo != nil && cast.message != nil {
-				go h.persistMessage(cast.message)
+				h.persistWG.Add(1)
+				go func(msg *entity.Message) {
+					defer h.persistWG.Done()
+					h.persistMessage(msg)
+				}(cast.message)
 			}
 
 		// ── Read receipts ────────────────────────────────────────────────────
@@ -289,7 +300,11 @@ func (h *Hub) Run(stop <-chan struct{}) {
 				h.fanout(cmd.roomID, frame, nil)
 			}
 			if h.readRepo != nil {
-				go h.persistRead(cmd.messageID, cmd.client.UserID, readAt)
+				h.persistWG.Add(1)
+				go func(msgID, userID string, at time.Time) {
+					defer h.persistWG.Done()
+					h.persistRead(msgID, userID, at)
+				}(cmd.messageID, cmd.client.UserID, readAt)
 			}
 
 		// ── Remote delivery (from Redis) ─────────────────────────────────────
@@ -304,8 +319,12 @@ func (h *Hub) Run(stop <-chan struct{}) {
 		case <-stop:
 			h.log.Info("hub stopping")
 			for _, client := range h.clients {
-				close(client.send)
+				client.closeSend()
 			}
+			// Wait for all in-flight persistence goroutines before returning.
+			// This ensures no DB writes are orphaned when the pool is closed.
+			h.persistWG.Wait()
+			h.log.Info("hub stopped")
 			return
 		}
 	}
@@ -342,14 +361,14 @@ func (h *Hub) safeSend(client *Client, msg []byte) {
 	}
 }
 
-// evict closes the client's send channel and removes it from all rooms and the
-// clients map. Must be called from Hub.Run() only.
+// evict closes the client's send channel (exactly once) and removes it from
+// all rooms and the clients map. Must be called from Hub.Run() only.
 func (h *Hub) evict(client *Client) {
 	for roomID := range client.rooms {
 		h.removeFromRoom(client, roomID)
 	}
 	delete(h.clients, client.ID)
-	close(client.send)
+	client.closeSend() // sync.Once: safe even if called multiple times
 }
 
 // removeFromRoom removes client from one room. Deletes the room when it
@@ -369,7 +388,7 @@ func (h *Hub) removeFromRoom(client *Client, roomID string) {
 }
 
 // persistRead saves a read receipt to the repository.
-// Runs in its own goroutine so it never blocks the hub event loop.
+// Runs in its own goroutine (tracked by persistWG) so it never blocks the hub event loop.
 func (h *Hub) persistRead(messageID, userID string, readAt time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -383,7 +402,7 @@ func (h *Hub) persistRead(messageID, userID string, readAt time.Time) {
 }
 
 // persistMessage saves a chat message to the repository.
-// Runs in its own goroutine so it never blocks the hub event loop.
+// Runs in its own goroutine (tracked by persistWG) so it never blocks the hub event loop.
 func (h *Hub) persistMessage(msg *entity.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

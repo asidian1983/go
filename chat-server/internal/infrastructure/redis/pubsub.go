@@ -105,8 +105,10 @@ func (m *Manager) Unsubscribe(roomID string) {
 }
 
 // Run starts the receive loop with exponential-backoff reconnect.
-// Blocks until stop is closed.
+// Blocks until stop is closed. Closes the deliver channel on exit so that
+// the Hub's bridge goroutine (range over Deliver()) exits cleanly.
 func (m *Manager) Run(stop <-chan struct{}) {
+	defer close(m.deliver)
 	backoff := time.Second
 	for {
 		if err := m.runOnce(stop); err == nil {
