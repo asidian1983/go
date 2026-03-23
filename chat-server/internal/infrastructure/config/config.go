@@ -38,6 +38,10 @@ type ServerConfig struct {
 	ReadTimeout     time.Duration
 	WriteTimeout    time.Duration
 	ShutdownTimeout time.Duration
+	// AllowedOrigins is the set of origins permitted for WebSocket upgrades.
+	// Empty slice means same-host check only (recommended for production).
+	// Use ["*"] only for local development.
+	AllowedOrigins []string
 }
 
 func Load() (*Config, error) {
@@ -48,6 +52,7 @@ func Load() (*Config, error) {
 	v.SetDefault("server.read_timeout", "10s")
 	v.SetDefault("server.write_timeout", "10s")
 	v.SetDefault("server.shutdown_timeout", "15s")
+	v.SetDefault("server.allowed_origins", []string{})
 	v.SetDefault("redis.enabled", false)
 	v.SetDefault("redis.addr", "localhost:6379")
 	v.SetDefault("jwt.expiry", "24h")
@@ -75,6 +80,7 @@ func Load() (*Config, error) {
 		ReadTimeout:     v.GetDuration("server.read_timeout"),
 		WriteTimeout:    v.GetDuration("server.write_timeout"),
 		ShutdownTimeout: v.GetDuration("server.shutdown_timeout"),
+		AllowedOrigins:  v.GetStringSlice("server.allowed_origins"),
 	}
 	cfg.Redis = RedisConfig{
 		Enabled: v.GetBool("redis.enabled"),

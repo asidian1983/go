@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,15 +37,18 @@ type Client struct {
 	// Owned exclusively by Hub.Run(); must not be touched outside that goroutine.
 	rooms map[string]struct{}
 
-	hub  *Hub
-	conn *websocket.Conn
-	send chan []byte
-	log  *zap.Logger
+	hub      *Hub
+	conn     *websocket.Conn
+	send     chan []byte
+	sendOnce sync.Once // guards close(send) against double-close panics
+	log      *zap.Logger
 }
 
 func newClientID() string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("ws: crypto/rand unavailable: " + err.Error())
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -59,6 +63,12 @@ func NewClient(hub *Hub, conn *websocket.Conn, userID string, log *zap.Logger) *
 		send:   make(chan []byte, 256),
 		log:    log,
 	}
+}
+
+// closeSend closes the send channel exactly once.
+// Safe to call from multiple goroutines or multiple times.
+func (c *Client) closeSend() {
+	c.sendOnce.Do(func() { close(c.send) })
 }
 
 // ReadPump pumps inbound WebSocket frames to the hub.
@@ -96,6 +106,7 @@ func (c *Client) ReadPump() {
 
 // WritePump pumps outbound messages from the send channel to the WebSocket.
 // One goroutine per client; sends a close frame when the hub closes send.
+// Each message is delivered as its own WebSocket text frame (valid JSON).
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -112,21 +123,16 @@ func (c *Client) WritePump() {
 				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-
-			w, err := c.conn.NextWriter(websocket.TextMessage)
-			if err != nil {
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				return
 			}
-			_, _ = w.Write(msg)
-
-			// Batch any already-queued messages into the same write frame.
+			// Drain any already-queued messages, each as its own frame.
 			n := len(c.send)
 			for range n {
-				_, _ = w.Write([]byte{'\n'})
-				_, _ = w.Write(<-c.send)
-			}
-			if err := w.Close(); err != nil {
-				return
+				_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := c.conn.WriteMessage(websocket.TextMessage, <-c.send); err != nil {
+					return
+				}
 			}
 
 		case <-ticker.C:

@@ -2,6 +2,7 @@ package ws
 
 import (
 	"net/http"
+	"net/url"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -10,22 +11,50 @@ import (
 	"github.com/asidian1983/chat-server/internal/adapter/http/middleware"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
-	WriteBufferSize: 4096,
-	// TODO: replace with an origin allowlist in production.
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
 // Handler manages the HTTP → WebSocket upgrade.
 type Handler struct {
-	hub *Hub
-	log *zap.Logger
+	hub      *Hub
+	upgrader websocket.Upgrader
+	log      *zap.Logger
 }
 
 // NewHandler constructs a Handler wired to the given Hub.
-func NewHandler(hub *Hub, log *zap.Logger) *Handler {
-	return &Handler{hub: hub, log: log}
+// allowedOrigins is the set of origins permitted for WebSocket upgrades.
+// An empty slice means same-host check only (recommended for production).
+// Pass []string{"*"} to allow all origins (development only).
+func NewHandler(hub *Hub, allowedOrigins []string, log *zap.Logger) *Handler {
+	allowed := make(map[string]struct{}, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[o] = struct{}{}
+	}
+
+	u := websocket.Upgrader{
+		ReadBufferSize:  4096,
+		WriteBufferSize: 4096,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// Non-browser clients (wscat, load tester, etc.) send no Origin.
+				return true
+			}
+			// Wildcard: allow all origins (dev only).
+			if _, ok := allowed["*"]; ok {
+				return true
+			}
+			// Explicit allowlist match.
+			if _, ok := allowed[origin]; ok {
+				return true
+			}
+			// Same-host fallback: compare origin host to request host.
+			u, err := url.Parse(origin)
+			if err != nil {
+				return false
+			}
+			return u.Host == r.Host
+		},
+	}
+
+	return &Handler{hub: hub, upgrader: u, log: log}
 }
 
 // ServeWS upgrades the connection to WebSocket and starts the client pumps.
@@ -41,7 +70,7 @@ func (h *Handler) ServeWS(c *gin.Context) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		h.log.Error("websocket upgrade failed", zap.Error(err))
 		return
