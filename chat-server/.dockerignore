@@ -1,0 +1,28 @@
+# Version control
+.git/
+.gitignore
+
+# Development artefacts
+*.test
+*.out
+/tmp/
+/bin/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local config overrides and secrets — never bake into image
+.env
+.env.*
+configs/config.local.yaml
+
+# Load test tool — not part of the server binary
+tools/
+
+# Documentation
+docs/
+*.md
