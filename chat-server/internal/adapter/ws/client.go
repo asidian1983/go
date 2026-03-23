@@ -200,6 +200,22 @@ func (c *Client) route(raw []byte) {
 			},
 		}
 
+	case EventRead:
+		if env.RoomID == "" {
+			c.sendErr("bad_request", "read requires a non-empty room_id in the envelope")
+			return
+		}
+		var p ReadPayload
+		if err := json.Unmarshal(env.Payload, &p); err != nil || len(p.MessageIDs) == 0 {
+			c.sendErr("bad_request", "read requires non-empty message_ids in payload")
+			return
+		}
+		for _, msgID := range p.MessageIDs {
+			if msgID != "" {
+				c.hub.ReadReceipt <- readReceiptCmd{client: c, roomID: env.RoomID, messageID: msgID}
+			}
+		}
+
 	default:
 		c.sendErr("unknown_event", "unrecognised event type: "+string(env.Event))
 	}

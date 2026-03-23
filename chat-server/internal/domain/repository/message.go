@@ -16,3 +16,10 @@ type MessageRepository interface {
 	// ordered newest-first. Pass time.Now() to get the latest page.
 	ByRoom(ctx context.Context, roomID entity.RoomID, limit int, before time.Time) ([]entity.Message, error)
 }
+
+// ReadRepository is the persistence contract for read receipts.
+type ReadRepository interface {
+	// MarkRead records that userID has read messageID at readAt.
+	// Duplicate records (same messageID + userID) are silently ignored.
+	MarkRead(ctx context.Context, messageID string, userID entity.UserID, readAt time.Time) error
+}

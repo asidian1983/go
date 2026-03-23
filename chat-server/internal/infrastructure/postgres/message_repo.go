@@ -35,6 +35,18 @@ func (r *MessageRepo) Save(ctx context.Context, msg *entity.Message) error {
 	return err
 }
 
+// MarkRead records that userID has read messageID at readAt.
+// Duplicate records are silently ignored (idempotent).
+func (r *MessageRepo) MarkRead(ctx context.Context, messageID string, userID entity.UserID, readAt time.Time) error {
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO message_reads (message_id, user_id, read_at)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (message_id, user_id) DO NOTHING`,
+		messageID, string(userID), readAt,
+	)
+	return err
+}
+
 // ByRoom returns up to limit messages for roomID with created_at < before,
 // ordered newest-first (caller reverses for display if needed).
 func (r *MessageRepo) ByRoom(ctx context.Context, roomID entity.RoomID, limit int, before time.Time) ([]entity.Message, error) {

@@ -36,6 +36,16 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_room_created
 	ON messages (room_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS message_reads (
+	message_id  TEXT        NOT NULL,
+	user_id     TEXT        NOT NULL,
+	read_at     TIMESTAMPTZ NOT NULL,
+	PRIMARY KEY (message_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_message_reads_message
+	ON message_reads (message_id);
 `
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {

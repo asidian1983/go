@@ -57,18 +57,21 @@ func main() {
 
 	// ── Postgres (optional) ───────────────────────────────────────────────────
 	var msgRepo repository.MessageRepository
+	var readRepo repository.ReadRepository
 	if cfg.Postgres.Enabled {
 		pool, err := postgres.Open(context.Background(), cfg.Postgres.DSN)
 		if err != nil {
 			panic("failed to connect to postgres: " + err.Error())
 		}
 		defer pool.Close()
-		msgRepo = postgres.NewMessageRepo(pool)
+		repo := postgres.NewMessageRepo(pool)
+		msgRepo = repo
+		readRepo = repo
 		log.Info("postgres enabled", zap.String("dsn", cfg.Postgres.DSN))
 	}
 
 	// ── Hub ───────────────────────────────────────────────────────────────────
-	hub := wsadapter.NewHub(log, rps, msgRepo)
+	hub := wsadapter.NewHub(log, rps, msgRepo, readRepo)
 	hubStop := make(chan struct{})
 	go hub.Run(hubStop)
 
