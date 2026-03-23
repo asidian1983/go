@@ -13,11 +13,13 @@ const (
 	EventJoin    EventType = "join"    // join a room
 	EventLeave   EventType = "leave"   // leave a room
 	EventMessage EventType = "message" // send a chat message to a room
+	EventRead    EventType = "read"    // mark messages as read
 
 	// Server → Client events.
-	EventAck    EventType = "ack"    // operation succeeded
-	EventError  EventType = "error"  // operation rejected
-	EventNotify EventType = "notify" // system notification (member joined / left)
+	EventAck         EventType = "ack"          // operation succeeded
+	EventError       EventType = "error"        // operation rejected
+	EventNotify      EventType = "notify"       // system notification (member joined / left)
+	EventReadReceipt EventType = "read_receipt" // a user has read a message
 )
 
 // Envelope is the top-level wrapper for every WebSocket frame.
@@ -43,6 +45,12 @@ type LeavePayload struct {
 // SendPayload is the body of an EventMessage frame.
 type SendPayload struct {
 	Message string `json:"message"`
+}
+
+// ReadPayload is the body of an EventRead frame.
+// MessageIDs is a batch of message IDs the client has read.
+type ReadPayload struct {
+	MessageIDs []string `json:"message_ids"`
 }
 
 // ---------- Outbound payloads (server → client) ----------
@@ -75,6 +83,13 @@ type NotifyPayload struct {
 	RoomID string `json:"room_id"`
 	UserID string `json:"user_id"`
 	Text   string `json:"text"`
+}
+
+// ReadReceiptPayload carries a read acknowledgement for a single message.
+type ReadReceiptPayload struct {
+	MessageID string    `json:"message_id"`
+	UserID    string    `json:"user_id"`
+	ReadAt    time.Time `json:"read_at"`
 }
 
 // ---------- Helpers ----------

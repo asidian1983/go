@@ -25,6 +25,12 @@ type leaveCmd struct {
 	roomID string
 }
 
+type readReceiptCmd struct {
+	client    *Client
+	roomID    string
+	messageID string
+}
+
 // roomcast delivers msg to every member of roomID.
 // sender is the originating client (used for authorisation); nil means a
 // server-generated broadcast that skips the membership check.
@@ -76,11 +82,12 @@ type Hub struct {
 	// rooms: roomID → (connectionID → *Client). Owned by Run().
 	rooms map[string]map[string]*Client
 
-	Register   chan *Client
-	Unregister chan *Client
-	Join       chan joinCmd
-	Leave      chan leaveCmd
-	Broadcast  chan roomcast
+	Register    chan *Client
+	Unregister  chan *Client
+	Join        chan joinCmd
+	Leave       chan leaveCmd
+	Broadcast   chan roomcast
+	ReadReceipt chan readReceiptCmd
 
 	// pubsub is optional; nil means single-node mode (no Redis).
 	pubsub *redispubsub.Manager
@@ -90,6 +97,8 @@ type Hub struct {
 
 	// msgRepo is optional; nil means messages are not persisted.
 	msgRepo repository.MessageRepository
+	// readRepo is optional; nil means read receipts are not persisted.
+	readRepo repository.ReadRepository
 
 	log *zap.Logger
 }
@@ -97,18 +106,21 @@ type Hub struct {
 // NewHub constructs a Hub ready to be started with Run().
 // Pass a non-nil pubsub to enable Redis-backed horizontal scaling.
 // Pass a non-nil msgRepo to enable message persistence.
-func NewHub(log *zap.Logger, pubsub *redispubsub.Manager, msgRepo repository.MessageRepository) *Hub {
+// Pass a non-nil readRepo to enable read-receipt persistence.
+func NewHub(log *zap.Logger, pubsub *redispubsub.Manager, msgRepo repository.MessageRepository, readRepo repository.ReadRepository) *Hub {
 	h := &Hub{
-		clients:    make(map[string]*Client),
-		rooms:      make(map[string]map[string]*Client),
-		Register:   make(chan *Client, 256),
-		Unregister: make(chan *Client, 256),
-		Join:       make(chan joinCmd, 256),
-		Leave:      make(chan leaveCmd, 256),
-		Broadcast:  make(chan roomcast, 512),
-		pubsub:     pubsub,
-		msgRepo:    msgRepo,
-		log:        log,
+		clients:     make(map[string]*Client),
+		rooms:       make(map[string]map[string]*Client),
+		Register:    make(chan *Client, 256),
+		Unregister:  make(chan *Client, 256),
+		Join:        make(chan joinCmd, 256),
+		Leave:       make(chan leaveCmd, 256),
+		Broadcast:   make(chan roomcast, 512),
+		ReadReceipt: make(chan readReceiptCmd, 512),
+		pubsub:      pubsub,
+		msgRepo:     msgRepo,
+		readRepo:    readRepo,
+		log:         log,
 	}
 	if pubsub != nil {
 		h.remoteDeliver = make(chan roomcast, 512)
@@ -254,6 +266,32 @@ func (h *Hub) Run(stop <-chan struct{}) {
 				go h.persistMessage(cast.message)
 			}
 
+		// ── Read receipts ────────────────────────────────────────────────────
+		case cmd := <-h.ReadReceipt:
+			if _, in := cmd.client.rooms[cmd.roomID]; !in {
+				h.safeSend(cmd.client, buildEnvelope(EventError, cmd.roomID,
+					ErrorPayload{Code: "not_in_room", Message: "join the room before sending read receipts"}))
+				break
+			}
+			readAt := time.Now().UTC()
+			frame := buildEnvelope(EventReadReceipt, cmd.roomID, ReadReceiptPayload{
+				MessageID: cmd.messageID,
+				UserID:    cmd.client.UserID,
+				ReadAt:    readAt,
+			})
+			if h.pubsub != nil {
+				if err := h.pubsub.Publish(context.Background(), cmd.roomID, frame); err != nil {
+					h.log.Error("redis publish read receipt failed, falling back to local fanout",
+						zap.String("room", cmd.roomID), zap.Error(err))
+					h.fanout(cmd.roomID, frame, nil)
+				}
+			} else {
+				h.fanout(cmd.roomID, frame, nil)
+			}
+			if h.readRepo != nil {
+				go h.persistRead(cmd.messageID, cmd.client.UserID, readAt)
+			}
+
 		// ── Remote delivery (from Redis) ─────────────────────────────────────
 		case cast := <-h.remoteDeliver:
 			// Message arrived from another node (or echoed back from Redis).
@@ -328,6 +366,20 @@ func (h *Hub) removeFromRoom(client *Client, roomID string) {
 		}
 	}
 	delete(client.rooms, roomID)
+}
+
+// persistRead saves a read receipt to the repository.
+// Runs in its own goroutine so it never blocks the hub event loop.
+func (h *Hub) persistRead(messageID, userID string, readAt time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.readRepo.MarkRead(ctx, messageID, entity.UserID(userID), readAt); err != nil {
+		h.log.Error("read receipt persist failed",
+			zap.String("messageID", messageID),
+			zap.String("userID", userID),
+			zap.Error(err),
+		)
+	}
 }
 
 // persistMessage saves a chat message to the repository.
